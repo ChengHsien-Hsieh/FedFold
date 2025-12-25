@@ -108,3 +108,205 @@ class LocalMaskCrossEntropyLoss(nn.CrossEntropyLoss):
             if c in labels:
                 mask[:, c] = 1
         return F.cross_entropy(input*mask, target, reduction='mean')
+
+
+# ============================================================
+# TCN (Temporal Convolutional Network) for NLP Tasks
+# Reference: Bai et al., "An Empirical Evaluation of Generic 
+#            Convolutional and Recurrent Networks for Sequence Modeling"
+# ============================================================
+
+class Chomp1d(nn.Module):
+    """
+    移除因果卷積（Causal Convolution）產生的額外 padding，
+    確保輸出序列長度等於輸入序列長度。
+    """
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    """
+    TCN 的基本構建塊（Residual Block），結構類似 ResNet 的 Block。
+    
+    結構：
+    x -> Conv1d -> Chomp1d -> ReLU -> Dropout ->
+         Conv1d -> Chomp1d -> ReLU -> Dropout -> (+) -> out
+                                                  |
+    x ----------------- (1x1 Conv if needed) -----+
+    
+    這與 ResNet 的 Block 結構完全同構，因此 FedFold 的寬度分割邏輯可直接套用。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        
+        # 第一個卷積層：Conv1d -> Chomp1d -> ReLU -> Dropout
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        # 第二個卷積層：Conv1d -> Chomp1d -> ReLU -> Dropout
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        # 網路主分支（與 ResNet 的 conv1->conv2 類似）
+        self.net = nn.Sequential(
+            self.conv1, self.chomp1, self.relu1, self.dropout1,
+            self.conv2, self.chomp2, self.relu2, self.dropout2
+        )
+        
+        # Shortcut 連接（與 ResNet 相同邏輯）
+        self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TCN(nn.Module):
+    """
+    Temporal Convolutional Network for NLP Text Classification
+    
+    與 ResNet 的設計理念完全對應：
+    - ResNet: Conv2d -> [layer1, layer2, layer3, layer4] -> AdaptiveAvgPool -> FC
+    - TCN:    Embedding -> [block1, block2, block3, block4] -> AdaptiveAvgPool -> FC
+    
+    這使得 FedFold 的寬度分割（width splitting）可以直接套用：
+    - hidden_size['16'] = [64, 128, 256, 512]   # 強設備
+    - hidden_size['1']  = [4, 8, 16, 32]        # 弱設備
+    
+    Arguments:
+        hidden_size: list[int], 各層的通道數，例如 [64, 128, 256, 512]
+        vocab_size: int, 詞彙表大小
+        embed_dim: int, 詞嵌入維度
+        n_class: int, 分類類別數
+        kernel_size: int, 卷積核大小
+        dropout: float, dropout 比例
+    """
+    def __init__(self, hidden_size, vocab_size=30000, embed_dim=128, n_class=4, 
+                 kernel_size=3, dropout=0.2, max_seq_len=256):
+        super(TCN, self).__init__()
+        
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.max_seq_len = max_seq_len
+        
+        # Word Embedding Layer（不參與寬度分割）
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        
+        # 建立 TCN 層（與 ResNet 的 layer1-4 對應）
+        # 從 embed_dim 逐漸擴展到 hidden_size[-1]
+        layers = []
+        num_levels = len(hidden_size)
+        
+        for i in range(num_levels):
+            dilation_size = 2 ** i  # 擴大感受野
+            in_channels = embed_dim if i == 0 else hidden_size[i - 1]
+            out_channels = hidden_size[i]
+            padding = (kernel_size - 1) * dilation_size
+            
+            layers.append(TemporalBlock(
+                in_channels, out_channels, kernel_size,
+                stride=1, dilation=dilation_size, padding=padding,
+                dropout=dropout
+            ))
+        
+        self.network = nn.Sequential(*layers)
+        
+        # 全局池化 + 分類器（與 ResNet 相同）
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(hidden_size[-1], n_class)
+
+    def forward(self, x):
+        """
+        Input:
+            x: (batch_size, seq_len) - token indices
+        Output:
+            (batch_size, n_class) - logits
+        """
+        # Embedding: (batch, seq_len) -> (batch, seq_len, embed_dim)
+        x = self.embedding(x)
+        
+        # 轉換為 Conv1d 格式: (batch, embed_dim, seq_len)
+        x = x.transpose(1, 2)
+        
+        # TCN forward: (batch, embed_dim, seq_len) -> (batch, hidden_size[-1], seq_len)
+        x = self.network(x)
+        
+        # Global pooling: (batch, hidden_size[-1], seq_len) -> (batch, hidden_size[-1], 1)
+        x = self.global_pool(x)
+        
+        # Flatten: (batch, hidden_size[-1], 1) -> (batch, hidden_size[-1])
+        x = x.squeeze(-1)
+        
+        # Classifier
+        x = self.fc(x)
+        
+        return x
+
+
+class TCNForHAR(nn.Module):
+    """
+    TCN for Human Activity Recognition (HAR) - 用於時間序列分類
+    
+    這個版本適用於類似 HAR 的時間序列資料，輸入是連續的感測器數據而非文字 token。
+    
+    Arguments:
+        hidden_size: list[int], 各層的通道數
+        input_channels: int, 輸入特徵維度（例如 HAR 的 9 軸感測器）
+        n_class: int, 分類類別數
+        kernel_size: int, 卷積核大小
+        dropout: float, dropout 比例
+    """
+    def __init__(self, hidden_size, input_channels=9, n_class=6, 
+                 kernel_size=3, dropout=0.2):
+        super(TCNForHAR, self).__init__()
+        
+        layers = []
+        num_levels = len(hidden_size)
+        
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = input_channels if i == 0 else hidden_size[i - 1]
+            out_channels = hidden_size[i]
+            padding = (kernel_size - 1) * dilation_size
+            
+            layers.append(TemporalBlock(
+                in_channels, out_channels, kernel_size,
+                stride=1, dilation=dilation_size, padding=padding,
+                dropout=dropout
+            ))
+        
+        self.network = nn.Sequential(*layers)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(hidden_size[-1], n_class)
+
+    def forward(self, x):
+        """
+        Input:
+            x: (batch_size, input_channels, seq_len) - 時間序列資料
+               或 (batch_size, seq_len, input_channels) - 會自動轉換
+        Output:
+            (batch_size, n_class) - logits
+        """
+        # 如果輸入格式是 (batch, seq_len, channels)，轉換為 (batch, channels, seq_len)
+        if x.dim() == 3 and x.size(1) > x.size(2):
+            x = x.transpose(1, 2)
+        
+        x = self.network(x)
+        x = self.global_pool(x)
+        x = x.squeeze(-1)
+        x = self.fc(x)
+        
+        return x

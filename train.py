@@ -11,9 +11,37 @@ from torch.utils.data import DataLoader
 import wandb
 
 from data import SplitDataset, get_dataset, split_dataset, set_parameters
-from model import Conv, LocalMaskCrossEntropyLoss, MLP, ResNet
+from model import Conv, LocalMaskCrossEntropyLoss, MLP, ResNet, TCN
 from fed import Federation
 from utils import Compressor, Utils
+
+
+def create_model(model_fn, hidden_size, cfg, device):
+    """
+    統一的模型建立函式，支援 CV 和 NLP 模型
+    
+    對於 TCN（NLP 模型），需要額外傳遞：
+    - vocab_size: 詞彙表大小
+    - embed_dim: 嵌入維度
+    - n_class: 類別數
+    - max_seq_len: 最大序列長度
+    """
+    if model_fn == TCN:
+        return model_fn(
+            hidden_size=hidden_size,
+            vocab_size=cfg.get('vocab_size', 30000),
+            embed_dim=cfg.get('embed_dim', 128),
+            n_class=cfg['n_class'],
+            max_seq_len=cfg.get('max_seq_len', 256)
+        ).to(device)
+    elif model_fn == ResNet:
+        return model_fn(hidden_size, n_class=cfg['n_class']).to(device)
+    elif model_fn == Conv:
+        return model_fn(hidden_size, n_class=cfg['n_class']).to(device)
+    elif model_fn == MLP:
+        return model_fn(hidden_size, n_class=cfg['n_class']).to(device)
+    else:
+        return model_fn(hidden_size).to(device)
 
 def fixSeed(seed):
     np.random.seed(seed)
@@ -104,14 +132,14 @@ model_list = []
 model_log = []
 
 if cfg['device_ratio'] == 'W10':
-    model_list.append(model_fn(hidden_size['1']).to(device))
+    model_list.append(create_model(model_fn, hidden_size['1'], cfg, device))
     model_log.append(1)
     total_bytes=0
     for param in model_list[0].parameters():
         total_bytes += param.data.nelement() * param.data.element_size()
     print(f"total bytes of model[{0}]: {total_bytes}")
 elif cfg['device_ratio'] == 'S10':
-    model_list.append(model_fn(hidden_size[str(TBW)]).to(device))
+    model_list.append(create_model(model_fn, hidden_size[str(TBW)], cfg, device))
     model_log.append(TBW)
     total_bytes=0
     for param in model_list[0].parameters():
@@ -122,7 +150,7 @@ else:
         i=0
         while TBW != 1:
             target = math.ceil(TBW/2)
-            model_list.append(model_fn(hidden_size[str(target)]).to(device))
+            model_list.append(create_model(model_fn, hidden_size[str(target)], cfg, device))
             model_log.append(target)
             TBW -= target
             total_bytes = 0
@@ -130,18 +158,18 @@ else:
                 total_bytes += param.data.nelement() * param.data.element_size()
             print(f"total bytes of model[{TBW}]: {total_bytes}")
             i+=1
-        model_list.append(model_fn(hidden_size['1']).to(device))
+        model_list.append(create_model(model_fn, hidden_size['1'], cfg, device))
         model_log.append(1)
         print(f"model list has {len(model_list)} elements")
     else: # fixed splitting
         target = math.ceil(TBW/2)
         remain = TBW - target
         while target >= cfg['fix_split']:
-            model_list.append(model_fn(hidden_size[str(cfg['fix_split'])]).to(device))
+            model_list.append(create_model(model_fn, hidden_size[str(cfg['fix_split'])], cfg, device))
             model_log.append(cfg['fix_split'])
             target -= cfg['fix_split']
         for _ in range(remain + target):         
-            model_list.append(model_fn(hidden_size['1']).to(device))
+            model_list.append(create_model(model_fn, hidden_size['1'], cfg, device))
             model_log.append(1)
 
 # calculate the number of BW
@@ -158,8 +186,17 @@ print(f'BW_cnt: {BW_cnt}')
 print(f'model_list: {model_log}')
 n_model = len(model_list)
 
-# for federation learning
-fed = Federation([model_list[i].state_dict() for i in range(n_model)])
+# 確定 model_name（在 Federation 初始化之前）
+model_name = 'Conv'  # 預設值
+if model_fn == ResNet:
+    model_name = 'ResNet'
+elif model_fn == TCN:
+    model_name = 'TCN'
+elif model_fn == MLP:
+    model_name = 'MLP'
+
+# for federation learning - 傳遞 model_name 作為 model_type
+fed = Federation([model_list[i].state_dict() for i in range(n_model)], model_type=model_name)
 
 # create loss function for FL training
 loss_fn = LocalMaskCrossEntropyLoss(cfg['n_class'])
@@ -178,7 +215,6 @@ print(f'device_cnt: {device_cnt}')
 # create model tag for saving model
 time_stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
 model_tag = f"{cfg['dataset']}_non-iid-{cfg['n_split']}_train-ratio-{cfg['train_ratio']}"
-model_name = 'Conv'
 if cfg['device_ratio'] == 'W10':
     model_tag += '_FedAvg_small'
 elif cfg['device_ratio'] == 'S10':
@@ -195,7 +231,8 @@ else:
 #     model_name = 'ResNet'
 if model_fn == ResNet:
     model_tag += '_ResNet'
-    model_name = 'ResNet'
+elif model_fn == TCN:
+    model_tag += '_TCN'
 print(f'model tag: {model_tag}')
 
 output_dir = f"./output/{model_tag}/{cfg['device_ratio']}_{time_stamp}"
@@ -347,25 +384,34 @@ for epoch in range(1, cfg['global_epochs'] + 1):
         bits = [1,2,4,8,16,32]
         random_number = random.randint(0, 5)
         # random_number = 0
-        if device_type[i] == 'S'or device_type[i] == 'M':                
-            models = []
-            split_size = 1
+        if device_type[i] == 'S' or device_type[i] == 'M':
+            # TCN 模型暫時不支援 need_expand 機制
+            # 因為 TCN 的 embedding 和 fc 層結構與 ResNet 不同
+            if model_name == 'TCN':
+                # 對於 TCN，直接上傳最大模型的參數（idx=0）
+                for idx in model_idx:
+                    quantized_dict = {k: Compressor.quantize(v, bits[random_number]) for k, v in model_list[idx].state_dict().items()}
+                    fed.upload(quantized_dict, idx, 0, 0)
+            else:
+                # ResNet/Conv 使用原來的 expand 邏輯
+                models = []
+                split_size = 1
 
-            reversed_model_idx = model_idx.copy()
-            reversed_model_idx.reverse()
-            for idx in reversed_model_idx:
-                models.append(model_list[idx].state_dict())
+                reversed_model_idx = model_idx.copy()
+                reversed_model_idx.reverse()
+                for idx in reversed_model_idx:
+                    models.append(model_list[idx].state_dict())
 
-            local_model = Utils.accum_model(models)
-            split_models = Utils.split_model(local_model, split_size, model_name, 1)
-            aggregate_model = Utils.accum_model(split_models)
-            total_bytes = 0
-            for param_name, param in aggregate_model.items():
-                total_bytes += param.nelement() * param.element_size()
-            print(f"total bytes: {total_bytes}") 
-            quantized_dict = {k: Compressor.quantize(v, bits[random_number]) for k, v in aggregate_model.items()} 
-            fed.upload(quantized_dict, 0, 0, 1)    
-            # fed.upload(local_model, 4, 1, 0)              
+                local_model = Utils.accum_model(models)
+                split_models = Utils.split_model(local_model, split_size, model_name, 1)
+                aggregate_model = Utils.accum_model(split_models)
+                total_bytes = 0
+                for param_name, param in aggregate_model.items():
+                    total_bytes += param.nelement() * param.element_size()
+                print(f"total bytes: {total_bytes}") 
+                quantized_dict = {k: Compressor.quantize(v, bits[random_number]) for k, v in aggregate_model.items()} 
+                fed.upload(quantized_dict, 0, 0, 1)    
+                # fed.upload(local_model, 4, 1, 0)              
         #     total_bytes_quantized = 0
         #     for k, v in quantized_dict.items():
         #         total_bytes_quantized += v.nelement() * (bits[random_number] / 8)  # bits to bytes

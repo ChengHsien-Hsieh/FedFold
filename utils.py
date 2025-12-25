@@ -277,8 +277,123 @@ class Utils:
             split_models.extend(Utils.split_resnet_params(local_model, hidden_size, moving_splitting))
         elif model_type =='Conv':
             split_models.extend(Utils.split_cnn_params(local_model, hidden_size, moving_splitting))
+        elif model_type == 'TCN':
+            split_models.extend(Utils.split_tcn_params(local_model, hidden_size, moving_splitting))
         # print(len(models))
         return split_models
+    
+    def split_tcn_params(global_params, hidden_sizes, moving_splitting):
+        """
+        TCN 參數分割邏輯 - 處理 Conv1d 的 3D 張量
+        
+        TCN 結構：
+        - embedding.weight: (vocab_size, embed_dim) - 不分割
+        - network.{i}.conv1.weight: (out_channels, in_channels, kernel_size)
+        - network.{i}.conv1.bias: (out_channels,)
+        - network.{i}.conv2.weight: (out_channels, out_channels, kernel_size)
+        - network.{i}.conv2.bias: (out_channels,)
+        - network.{i}.downsample.weight: (out_channels, in_channels, 1) - 如果存在
+        - fc.weight: (n_class, hidden_size[-1])
+        - fc.bias: (n_class,)
+        
+        與 ResNet 的對應：
+        - ResNet layer{i}.{j}.conv{k} <-> TCN network.{i}.conv{k}
+        - 切分邏輯完全一致，只是張量從 4D 變 3D
+        """
+        models = [{} for _ in hidden_sizes]
+        n_class = None  # 從 fc.bias 推斷
+        embed_dim = None  # 從 embedding 推斷
+        
+        for k, concat_param in global_params.items():
+            # 推斷類別數和嵌入維度
+            if 'fc.bias' in k:
+                n_class = concat_param.shape[0]
+            if 'embedding.weight' in k:
+                embed_dim = concat_param.shape[1]
+        
+        if n_class is None:
+            n_class = 4  # AGNews 預設
+        if embed_dim is None:
+            embed_dim = 128  # 預設 embedding 維度
+        
+        for k, concat_param in global_params.items():
+            start_idx1 = 0
+            start_idx2 = 0
+            
+            for i, hidden_size in enumerate(hidden_sizes):
+                # Embedding layer - 不分割（所有設備共享相同的詞嵌入）
+                if 'embedding' in k:
+                    models[i][k] = concat_param.clone()
+                    continue
+                
+                # 解析層索引：network.{layer_idx}.{component}
+                if 'network.' in k:
+                    parts = k.split('.')
+                    layer_idx = int(parts[1])
+                    component = parts[2]  # conv1, conv2, downsample, etc.
+                    
+                    # 計算 in_channels 和 out_channels
+                    out_channels = hidden_size[layer_idx]
+                    if layer_idx == 0:
+                        in_channels = embed_dim  # 第一層的輸入是 embedding 維度
+                    else:
+                        in_channels = hidden_size[layer_idx - 1]
+                    
+                    if 'conv1' in component:
+                        param_size1 = out_channels
+                        param_size2 = in_channels if 'weight' in k else None
+                    elif 'conv2' in component:
+                        param_size1 = out_channels
+                        param_size2 = out_channels if 'weight' in k else None
+                    elif 'downsample' in component:
+                        param_size1 = out_channels
+                        param_size2 = in_channels if 'weight' in k else None
+                    else:
+                        # 其他組件（如 chomp, relu 無參數）
+                        models[i][k] = concat_param.clone()
+                        continue
+                
+                # FC layer
+                elif 'fc.weight' in k:
+                    param_size1 = n_class
+                    param_size2 = hidden_size[-1]
+                elif 'fc.bias' in k:
+                    param_size1 = n_class
+                    param_size2 = None
+                else:
+                    # 未知層，直接複製
+                    models[i][k] = concat_param.clone()
+                    continue
+                
+                # 執行分割（與 ResNet 邏輯相同）
+                if moving_splitting:
+                    if concat_param.ndim == 1:  # Biases
+                        models[i][k] = concat_param[:param_size1].clone()
+                    else:  # 2D+ tensors (包括 Conv1d 的 3D)
+                        if param_size2 is not None:
+                            models[i][k] = concat_param[
+                                start_idx1:start_idx1 + param_size1,
+                                start_idx2:start_idx2 + param_size2,
+                                ...
+                            ].clone()
+                        else:
+                            models[i][k] = concat_param[start_idx1:start_idx1 + param_size1].clone()
+                    
+                    # 更新索引（FC 層不更新，因為只切輸出維度）
+                    if 'fc' not in k and concat_param.ndim > 1:
+                        start_idx1 += param_size1
+                        if param_size2 is not None:
+                            start_idx2 += param_size2
+                else:
+                    if concat_param.ndim == 1:
+                        models[i][k] = concat_param[:param_size1].clone()
+                    else:
+                        if param_size2 is not None:
+                            models[i][k] = concat_param[:param_size1, :param_size2, ...].clone()
+                        else:
+                            models[i][k] = concat_param[:param_size1].clone()
+        
+        return models
 
     # This function is very useless
     # it can only be used when all the models you want to combine are in the same size
@@ -300,6 +415,8 @@ class Utils:
             return Utils.concat_resnet(model, hidden_sizes)
         elif model_type == 'Conv':
             return Utils.concat_cnn(model, hidden_sizes)
+        elif model_type == 'TCN':
+            return Utils.concat_tcn(model, hidden_sizes)
 
     def concat_resnet(model, hidden_sizes):    
         concatenated_params = []
@@ -361,6 +478,75 @@ class Utils:
                             # print(f"Shape of concat_model[{k}]: {concat_model[k].shape}")                                                                                                                
                 concatenated_params.append(concat_model)
         # print(len(concatenated_params))
+        return concatenated_params
+
+    def concat_tcn(model, hidden_sizes):
+        """
+        TCN 模型拼接邏輯
+        
+        注意：TCN 與 ResNet/Conv 不同，某些參數不應該被拼接
+        - embedding.weight: 不拼接（vocab_size 和 embed_dim 固定）
+        - fc.bias: 不拼接（n_class 固定）
+        - fc.weight: 只在 dim=1（輸入維度）拼接
+        """
+        concatenated_params = []
+        model_tmp = copy.deepcopy(model)
+        
+        for hidden_size in hidden_sizes:
+            if hidden_size[0] == 4:  # 最小模型，直接使用
+                concatenated_params.append(model_tmp)
+            else:
+                concat_model = copy.deepcopy(model_tmp)
+                for _ in range(int(math.log(hidden_size[0], 2) - 2)):
+                    model_copy = copy.deepcopy(concat_model)
+                    for k, v in model_copy.items():
+                        # Embedding 層保持不變（不拼接）
+                        if 'embedding' in k:
+                            # 保持原值，不做任何操作
+                            pass
+                        # FC bias 保持不變（類別數固定）
+                        elif 'fc.bias' in k:
+                            # 保持原值，不做任何操作
+                            pass
+                        # FC weight 只在輸入維度（dim=1）拼接
+                        elif 'fc.weight' in k:
+                            concat_model[k] = torch.cat((concat_model[k], v), dim=1)
+                        # 1D 張量（卷積層的 bias）在 dim=0 拼接
+                        elif v.ndim == 1:
+                            concat_model[k] = torch.cat((concat_model[k], v), dim=0)
+                        # 2D 張量（不太可能在 TCN 中出現，但保留處理）
+                        elif v.ndim == 2:
+                            # 如果是 fc 相關的，跳過
+                            if 'fc' in k:
+                                pass
+                            else:
+                                concat_model[k] = torch.cat((concat_model[k], v), dim=0)
+                                diff = [concat_model[k].size(dim) - v.size(dim) for dim in range(v.dim())]
+                                if any(d > 0 for d in diff):
+                                    padding = []
+                                    for d in reversed(diff):
+                                        padding.extend((0, d))
+                                    padded_v = torch.nn.functional.pad(v, padding)
+                                else:
+                                    padded_v = v
+                                concat_model[k] = torch.cat((concat_model[k], padded_v), dim=1)
+                        # TCN 卷積權重（3D: out_channels, in_channels, kernel_size）
+                        elif v.ndim == 3:
+                            # 先在 out_channels 維度拼接
+                            concat_model[k] = torch.cat((concat_model[k], v), dim=0)
+                            # 處理 in_channels 維度的 padding
+                            diff = [concat_model[k].size(dim) - v.size(dim) for dim in range(v.dim())]
+                            if any(d > 0 for d in diff):
+                                padding = []
+                                for d in reversed(diff):
+                                    padding.extend((0, d))
+                                padded_v = torch.nn.functional.pad(v, padding)
+                            else:
+                                padded_v = v
+                            concat_model[k] = torch.cat((concat_model[k], padded_v), dim=1)
+                
+                concatenated_params.append(concat_model)
+        
         return concatenated_params
 
 
